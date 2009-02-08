@@ -17,6 +17,7 @@ The module reports to Nagios that the site is up and running normally, including
   * pending Drupal module updates
   * unwritable 'files' directory
   * Pending updates to the database schema
+  * Cron not running for a specified period
 
 If you already use Nagios in your organization to monitor your infrastructure, then
 this module will be useful for you. If you only run one or two Drupal sites, Nagios
@@ -31,9 +32,9 @@ This module exposes the following information from your web site:
 - Whether an action requiring the administrator's attention (e.g pending module updates,
   unreadable 'files' directory, ...etc.)
 
-To mitigate the security risks involve, make sure you use a unique user agent string.
-However, this is not a fool proof solution. If you are concerned about this information
-being publicly accessible, then don't use this module.
+To mitigate the security risks involve, make sure you use a unique ID. However, this is
+not a fool proof solution. If you are concerned about this information being publicly
+accessible, then don't use this module.
 
 Installation
 ------------
@@ -53,55 +54,149 @@ To enable this module do the following:
    Enable the module.
 
 2. Go to Admin -> Settings -> Nagios monitoring.
-   Enter a unique user agent string.
+   Enter a unique ID. This must match what you configure Nagios for.
+   See below for more details.
 
    Don't forget to configure Nagios accordingly. See below.
 
 Configuration for Nagios
 ------------------------
 
-For each Drupal site that you want to monitor, you should add one entry in Nagios.
+The exact way to configure Nagios depends on several factors, e.g. how many Drupal
+sites you want to monitor, the way Nagios is setup, ...etc.
 
-An entry for a site will look like so:
+The following way is just one of many ways to configure Nagios for Drupal. There are
+certainly other ways to do it, but it all centers on using the check_drupal command
+being run for each site.
 
-    define service{
-      use                 generic-service  ; Inherit default values from a template
-      host_name           drupal-host-name
-      service_description Drupal
-      check_command       check_http!-u /nagios -A "Drupal" -t 2 -M 5 -s "nagios=status:ok"
-    }
+1. Copy the check_drupal script in the nagios-plugin directory to your Nagios plugins
+   directory (e.g. /usr/lib/nagios/plugins).
+
+2. Change the commands.cfg file for Nagios to include the following:
+
+   define command{
+     command_name  check_drupal
+     command_line  /usr/lib/nagios/plugins/check_drupal -H $HOSTADDRESS$ -u $ARG1$ -T $ARG2$
+   }
+
+3. Create a hostgroup for the hosts that run Drupal and need to be monitored.
+   This is normally in a hostgroups.cfg file.
+   
+   define hostgroup {
+     hostgroup_name  drupal-servers
+     alias           Drupal servers
+     members         yoursite.example.com, mysite.example.com 
+   }
+
+4. Defined a service that will run for this host group
+
+   define service{
+     hostgroup_name         drupal-servers
+     service_description    DRUPAL
+     check_command          check_drupal!-U "unique_id" -t 2 
+     use                    generic-service
+     notification_interval  0 ; set > 0 if you want to be renotified
+   }
 
 Here is an explanation of some of the options:
 
--A "Drupal"
-  This is the user agent that Nagios will use when accessing your site. You should change this
-  to the unique string that is unique for your installation, and set Drupal's settings accordingly.
+-U "unique_id"
+  This parameter is required.
+  It is a unique identifier that is send as the user agent from the Nagios check_drupal script,
+  and has to match what the Drupal Nagios module has configured.  Both sides have to match,
+  otherwise, you will get "unauthorized" errors. The best way is to generate an MD5 or SHA1
+  string from a combination of data, such as date, city, company name, ...etc. For example:
+
+  $ echo "2003-Jan-17 Waterloo, Canada Honda" | md5sum
+
+  The result will be something like this:
+
+  645666c39f06514528987278c4071d85  -
+
+  The resulting hash is hard enough to deduce, and gives a first level protection against snooping.
 
 -t 2
+  This parameter is optional.
   This means that if the Drupal site does not respond in 2 seconds, an error will be reported
-  by Nagios. Increase this if you site is really slow.
+  by Nagios. Increase this value if you site is really slow.
+  The default is 2 seconds.
 
--M 5
-  This means that the response from Drupal should be fresh and no more than 5 seconds ago. This
-  will help determine if the site has stopped generating the status page.
+-P nagios
+  This parameter is optional.
+  For a normal site where Drupal is installed in the web server's DocumentRoot, leave this unchanged.
+  If you installed Drupal in a subdirectory, then change nagios to sub_directory/nagios
+  The default is the path nagios.
 
--u /nagios
-  For a normal site, leave this unchanged. If you installed Drupal in a subdirectory, then change
-  /nagios to /sub_directory/nagios
+API
+---
 
--s "nagios=status:ok"
-  This is the reponse to look for on success. Do not change this part.
+This module provides an API for other modules to report status back to Nagios.
+Your module should implement the following hooks:
 
-To Do / Wishlist
-----------------
+hook_nagios_info()
+------------------
+This hook is used to provide a way to enabled/disable a certain module from being included in Nagios
+reports and alerts.
 
-The following features are nice to have. If you can provide working and tested patches, please
-submit them in the issue queue on drupal.org.
+function yourmodule_nagios_info() {
+  return array(
+    'name'   => 'Your module name',
+    'id'     => 'IDENTIFIER',
+  );
+}
 
-* The nagios_get_data() function can provide a hook so modules can provide their own data into Nagios.
-* Would be nice if modules can override the 'status' element in the array as well.
-* Instead of using Nagios built in check_http, it would be more beneficial if we have our custom Drupal
-  plugin for Nagios that returns OK, WARNING or CRITICAL, and not just check for a string, or absence thereof.
+hook_nagios()
+-------------
+Your module should have a yourmodule_nagios() function that does the actual work of checking something
+and reporting back a status and some info.
+
+The data returned is an associative array as follows:
+
+array(
+  'key'  => 'IDENTIFIER', 
+  'data' => array(
+    'status' => STATUS_CODE,
+    'text'   => 'Text description for the problem',
+  ),
+);
+
+STATUS_CODE must be one of the following, defined in nagios.module:
+
+  NAGIOS_STATUS_OK 
+  NAGIOS_STATUS_UNKNOWN 
+  NAGIOS_STATUS_WARNING
+  NAGIOS_STATUS_CRITICAL
+
+Here is an example:
+
+function yourmodule_nagios() {
+  $data = array();
+
+  // Check something ...
+  $count = ...
+  if (!$count) {
+    $data = array(
+      'status' => NAGIOS_STATUS_WARNING,
+      'text'   => t('A very brief description of the warning'),
+    );
+  }
+  else {
+    $data = array(
+      'status' => NAGIOS_STATUS_OK,
+      'text'   => '',
+    );
+  }
+
+  return array(
+    'key' => 'IDENTIFIER', // This identifier will appear on Nagios' monitoring pages and alerts.
+    'data' => $data,
+  );
+}
+
+hook_nagios_settings()
+----------------------
+This hook provides standard form API elements to be included at admin/settings/nagios. You can
+set any thresholds you want in this hook.
 
 Bugs/Features/Patches:
 ----------------------
