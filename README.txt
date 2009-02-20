@@ -156,6 +156,8 @@ array(
   'key'  => 'IDENTIFIER', 
   'data' => array(
     'status' => STATUS_CODE,
+    'type    => 'state', // Can be a 'state' for OK, Warning, Critical, Unknown) or can be 'perf', which does
+                         // Cause an alert, but can be processed later by custom programs
     'text'   => 'Text description for the problem',
   ),
 );
@@ -177,12 +179,14 @@ function yourmodule_nagios() {
   if (!$count) {
     $data = array(
       'status' => NAGIOS_STATUS_WARNING,
+      'type'   => 'state',
       'text'   => t('A very brief description of the warning'),
     );
   }
   else {
     $data = array(
       'status' => NAGIOS_STATUS_OK,
+      'type'   => 'state',
       'text'   => '',
     );
   }
@@ -192,6 +196,9 @@ function yourmodule_nagios() {
     'data' => $data,
   );
 }
+
+For a real life example on how to use this API, check the performance.module in the devel project
+at http://drupal.org/project/devel
 
 hook_nagios_settings()
 ----------------------
