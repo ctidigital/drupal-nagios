@@ -1,3 +1,10 @@
 name = Nagios monitoring
 description = Exposes a page that Nagios can monitor
 core = 6.x
+
+; Information added by drupal.org packaging script on 2011-04-14
+version = "6.x-1.0-beta1"
+core = "6.x"
+project = "nagios"
+datestamp = "1302812816"
+

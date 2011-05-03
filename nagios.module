@@ -8,6 +8,12 @@ define('NAGIOS_STATUS_UNKNOWN',  1);
 define('NAGIOS_STATUS_WARNING',  2);
 define('NAGIOS_STATUS_CRITICAL', 3);
 
+define('NAGIOS_WATCHDOG_WARNING_THRESHOLD',10);
+define('NAGIOS_WATCHDOG_CRITICAL_THRESHOLD',2);
+define('NAGIOS_WATCHDOG_HOURS',24);
+define('NAGIOS_WEBSERVER_USERNAME','apache');
+
+
 /**
  * Mapping of defines to text strings that Nagios understands
  */
@@ -25,6 +31,8 @@ function nagios_status() {
  */
 function nagios_functions() {
   return array(
+    'requirements_detail' => t('Checking of hook_requirements. This includes the following: module updates, database schema, files directory writability, update.php protected, Lots of other good stuff ...'),
+    
     'requirements' => t('Checking of hook_requirements. This includes the following: module updates, database schema, files directory writability, update.php protected, Lots of other good stuff ...'),
 
     'cron' => t('Check whether cron has been running regularly'),
@@ -36,7 +44,10 @@ function nagios_functions() {
     'users' => t('Check the number of users for nagios performance data'),
 
     'modules' => t('Check the number of modules for nagios performance data'),
+    'modules_detail' => t('Check the number of modules for nagios performance data'),
     'themes'  => t('Check the number of themes for nagios performance data'),
+    'watchdog' => t('check that watchdog errors are within defined limits'),
+    'filesystem_access' => t('check that the filesystem path and all subdirectories are writable by the webserver user'),
   );
 }
 
@@ -76,6 +87,12 @@ function nagios_settings() {
     '#description'   => t('Restrict sending information to requests identified by this Unique ID. You should change this to some unique string for your organization, and configure Nagios accordingly. This makes Nagios data less accessible to curious users. See the README.txt for more details.')
   );
 
+  $form['nagios_show_outdated_names'] = array(
+    '#type'        => 'checkbox',
+    '#title'       => t('Show outdated module/theme name?'),
+    '#default_value' => variable_get('nagios_show_outdated_names', TRUE),
+  );
+  
   $form[$group] = array(
     '#type'        => 'fieldset',
     '#collapsible' => TRUE,
@@ -112,19 +129,52 @@ function nagios_settings() {
  * Callback for the nagios status page
  */
 function nagios_status_page() {
+  $args = func_get_args();
+  // Module to run checks for.
+  $module = array_shift($args);
+  // ID to run checks for.
+  $id = array_shift($args);
+  
   header("Pragma: no-cache");
   header("Expires: 0");
 
   $codes = nagios_status();
 
-  $nagios_data = nagios_invoke_all('nagios');
+  // Check the unique ID string first
+  $ua = variable_get('nagios_ua', 'Nagios');
+  if ($_SERVER['HTTP_USER_AGENT'] != $ua) {
+    // This is not an authorized unique id, so just return this default status.
+    $nagios_data = array(
+      'nagios' =>  array(
+        'DRUPAL' => array(
+          'status' => NAGIOS_STATUS_UNKNOWN,
+          'type'   => 'state',
+          'text'   => t('Unauthorized'),
+        ),
+      ),
+    );
+  }
+  else {
+    // Authorized so calling other modules
+    if ($module) {
+      // A specific module has been requested.
+      $nagios_data = array();
+      $nagios_data[$module] = module_invoke($module, 'nagios', $id);
+    }
+    else {
+      $nagios_data = nagios_invoke_all('nagios');
+    }
+  }
 
   // Find the highest level to be the overall status
   $severity = NAGIOS_STATUS_OK;
-
+  $min_severity = variable_get('nagios_min_report_severity', NAGIOS_STATUS_WARNING);
+  
   foreach($nagios_data as $module_name => $module_data) {
     foreach($module_data as $key => $value) {
-      $severity = max($severity, $value['status']);
+      if ($value['status'] >= $min_severity) {
+        $severity = max($severity, $value['status']);
+      } 
     }
   }
 
@@ -138,10 +188,54 @@ function nagios_status_page() {
     foreach($module_data as $key => $value) {
       switch($value['type']) {
         case 'state':
-          $tmp_state = $key . ':' . $codes[$value['status']];
+          // If status is larger then minimum severity
+          if ($value['status'] >= $min_severity) {
+            $tmp_state = $key . ':' . $codes[$value['status']];
+          }
+          else {
+            $tmp_state = $key . ':' . $codes[NAGIOS_STATUS_OK];
+          }  
+         
           if (!empty($value['text'])) {
             $tmp_state .= '=' . $value['text'];
           }
+          
+          if (
+            variable_get('nagios_show_outdated_names', TRUE) &&
+            $key == 'ADMIN' &&
+            $value['text'] == 'Module and theme update status'
+            ) {
+          	$tmp_projects = update_calculate_project_data(update_get_projects());
+          	$outdated_count = 0;
+          	foreach ($tmp_projects as $projkey => $projval) {
+  	          if ($projval['status'] < UPDATE_CURRENT && $projval['status'] >= UPDATE_NOT_SECURE) {
+  	          	switch ($projval['status']) {
+  	          	  case UPDATE_NOT_SECURE:
+  	          	    $tmp_projstatus = t('NOT SECURE');
+  	          	    break;
+  	          	  case UPDATE_REVOKED:
+  	          	    $tmp_projstatus = t('REVOKED');
+  	          	    break;
+  	          	  case UPDATE_NOT_SUPPORTED:
+  	          	    $tmp_projstatus = t('NOT SUPPORTED');
+  	          	    break;
+  	          	  case UPDATE_NOT_CURRENT:
+  	          	    $tmp_projstatus = t('NOT CURRENT');
+  	          	    break;
+  	          	  default:
+  	          	    $tmp_projstatus = $projval['status'];
+  	            }
+
+          	    $tmp_modules .= ' ' . $projkey . ':' . $tmp_projstatus;
+          	    $outdated_count++;
+          	  }
+          	}
+          	if ($outdated_count > 0) {
+          	  $tmp_modules = trim($tmp_modules);
+              $tmp_state .= " ($tmp_modules)";
+            }
+          }
+
           $output_state[] = $tmp_state;
           break;
 
@@ -217,6 +311,58 @@ function nagios_nagios_settings() {
     '#description'   => t('Issue a critical alert when cron has not been running for this duration (in minutes). Default is 60 minutes.')
   );
 
+  $form[$group]['nagios_min_report_severity'] = array(
+    '#type'          => 'select',
+    '#title'         => t('Mininum report severity'),
+    '#default_value' => variable_get('nagios_min_report_severity', NAGIOS_STATUS_WARNING),
+    '#options'       => nagios_status(),
+    '#description'   => t('Issue an alert only for this minimum severity, not for lower severities.'),
+  );
+  
+  $form['watchdog_settings'] = array(  
+    '#type'        => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed'   => FALSE,
+    '#title'       => t('Nagios Watchdog Settings'),
+    '#description' => t('Thresholds for the nagios watchdog check.'),
+  );
+  $form['watchdog_settings']['nagios_watchdog_warning_threshold'] = array(  
+    '#type'          => 'textfield',
+    '#title'         => t('Warning Threshold'),
+    '#size'          => 15,
+    '#default_value' => variable_get('nagios_watchdog_warning_threshold', NAGIOS_WATCHDOG_WARNING_THRESHOLD),
+    '#description'   => t('maximum number of warnings of watchdog severity warning or less (more severe) before nagios reports warning.')
+  );
+  $form['watchdog_settings']['nagios_watchdog_critical_threshold'] = array(
+    '#type'          => 'textfield',
+    '#title'         => t('Critical Threshold'),
+    '#size'          => 15,
+    '#default_value' => variable_get('nagios_watchdog_critical_threshold', NAGIOS_WATCHDOG_CRITICAL_THRESHOLD),
+    '#description'   => t('maximum number of errors of watchdog severity critical or less (more severe) before nagios reports warning.')
+  );
+  $form['watchdog_settings']['nagios_watchdog_hours'] = array(  
+    '#type'          => 'textfield',
+    '#title'         => t('Hours'),
+    '#size'          => 15,
+    '#default_value' => variable_get('nagios_watchdog_hours', NAGIOS_WATCHDOG_HOURS),
+    '#description'   => t('How many hours to go back in the logs.')
+  );
+  
+  $form['filesystem_access_settings'] = array(
+    '#type'        => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed'   => FALSE,
+    '#title'       => t('Nagios Filesystem Access Check Settings'),
+    '#description' => t('Thresholds for the nagios watchdog check.'),
+  );
+  $form['filesystem_access_settings']['nagios_webserver_username'] = array(
+    '#type'          => 'textfield',
+    '#title'         => t('Server User Name'),
+    '#size'          => 15,
+    '#default_value' => variable_get('nagios_webserver_username', NAGIOS_WEBSERVER_USERNAME ),
+    '#description'   => t('The webserver user name.')
+  );
+  
   return $form;
 }
 
@@ -224,19 +370,6 @@ function nagios_nagios_settings() {
  * Implementation of hook_nagios
  */
 function nagios_nagios() {
-  // Check the unique ID string first
-  $ua = variable_get('nagios_ua', 'Nagios');
-  if ($_SERVER['HTTP_USER_AGENT'] != $ua) {
-    // This is not an authorized unique id, so do not send information out
-    return array(
-      'DRUPAL' => array(
-        'status' => NAGIOS_STATUS_UNKNOWN,
-        'type'   => 'state',
-        'text'   => t('Unauthorized'),
-      ),
-    );
-  }
-
   $status = array();
   foreach(nagios_functions() as $function => $description) {
     if (variable_get('nagios_func_' . $function, TRUE)) {
@@ -249,7 +382,11 @@ function nagios_nagios() {
   return $status;
 }
 
-function nagios_check_requirements() {
+function nagios_check_requirements_detail( $args ){
+  $verbose = false;
+  if ( isset( $args[0] ) && in_array( 'verbose', $args ) ){
+    $verbose = true;
+  }
   // Load .install files
   include_once './includes/install.inc';
   drupal_load_updates();
@@ -257,10 +394,120 @@ function nagios_check_requirements() {
   // Get the run-time requirements and status information.
   $reqs = module_invoke_all('requirements', 'runtime');
 
+  $desc = '';
+  $fail_counter = array();
+  
+  $max_severity = REQUIREMENT_OK;
+  
+  foreach ($reqs as $key => $requirement) {
+    if (isset($requirement['severity'])) {
+      $requirement_severity = $requirement['severity'];
+      // Ignore update_core warning if update cache has expired and nagios_cron_duration has not passed by yet
+      if ($key == 'update_core' && $requirement_severity == REQUIREMENT_WARNING && $requirement['reason'] == UPDATE_UNKNOWN) {
+        $grace = 60 * variable_get('nagios_cron_duration', 60);
+        $expire = db_result(db_query("SELECT expire FROM {cache_update} WHERE cid = '%s'", 'update_available_releases'));
+        if ($expire && time() < ($expire + $grace)) {
+          continue;
+        }
+      }
+      if ($requirement_severity > REQUIREMENT_OK ) {
+        switch( $requirement_severity ){
+          case REQUIREMENT_WARNING:
+            $severity_alias = 'warnings';
+            break;
+          case REQUIREMENT_ERROR:
+            $severity_alias = 'errors';
+            break;
+          default:
+            $severity_alias = 'unknown';
+            break;
+        }
+        $fail_counter[$severity_alias] = isset( $fail_counter[$severity_alias] ) ? ++$fail_counter[$severity_alias] : 1;
+        if ( $verbose ){
+          $desc .= $desc ? ", " . $requirement['title'] : $requirement['title'];
+          $desc .= ' (' . $requirement['description'] . ')';
+        }
+      }
+      if ( $requirement_severity > $max_severity ){
+        $max_severity = $requirement['severity'];
+      }
+    }
+  }
+
+  // Create a status to pass back, and a text description too
+  switch($max_severity) {
+    case REQUIREMENT_OK:
+    case REQUIREMENT_INFO:
+      $data = array(
+        'status' => NAGIOS_STATUS_OK, 
+        'type'   => 'state',
+        'text'   => '',
+      );
+      break;
+    case REQUIREMENT_WARNING:
+      $data = array(
+        'status' => NAGIOS_STATUS_WARNING, 
+        'type'   => 'state',
+        'text'   => t('@desc ', array('@desc' => $desc)),
+      );
+      break;
+    case REQUIREMENT_ERROR:
+      $data = array(
+        'status' => NAGIOS_STATUS_CRITICAL, 
+        'type'   => 'state',
+        'text'   => t('@desc ', array('@desc' => $desc)),
+      );
+      break;
+    default:
+      $data = array(
+        'status' => NAGIOS_STATUS_UNKNOWN, 
+        'type'   => 'state',
+        'text'   => t('severity is @severity ',array('@severity' => $max_severity)),
+      );
+      break;
+  }
+  $data['text'] .= nagios_format_fail_count( $fail_counter );
+  
+  return array(
+    'key' => 'ADMIN_DETAIL',
+    'data' => $data,
+  );
+}
+
+function nagios_format_fail_count( $fail_counter ){
+  $str_fail_count = '';
+  $first = true;
+  foreach ( $fail_counter as $severity_alias => $fail_count ){
+    if ( $first ){
+      $first = false;
+    }
+    else {
+      $str_fail_count .= ', ';
+    }
+    $str_fail_count .= $severity_alias . ':' . $fail_count;
+  }
+  return $str_fail_count;
+}
+
+function nagios_check_requirements() {
+  // Load .install files
+  include_once './includes/install.inc';
+  drupal_load_updates();
+
+  // Get the run-time requirements and status information.
+  $reqs = module_invoke_all('requirements', 'runtime');
   // Check the requirements as to the most severe status
   $severity = REQUIREMENT_OK;
   foreach ($reqs as $key => $requirement) {
     if (isset($requirement['severity'])) {
+      // Ignore update_core warning if update cache has expired and nagios_cron_duration has not passed by yet
+      if ($key == 'update_core' && $requirement['severity'] == REQUIREMENT_WARNING && $requirement['reason'] == UPDATE_UNKNOWN) {
+        $grace = 60 * variable_get('nagios_cron_duration', 60);
+        $expire = db_result(db_query("SELECT expire FROM {cache_update} WHERE cid = '%s'", 'update_available_releases'));
+        if ($expire && time() < ($expire + $grace)) {
+          continue;
+        }
+      }
       if ($requirement['severity'] > $severity) {
         $severity = $requirement['severity'];
         $desc = $requirement['title'];
@@ -408,6 +655,137 @@ function nagios_check_modules() {
   );
 }
 
+function nagios_check_modules_detail( $args ) {
+  $verbose = false;
+  if ( isset( $args[0] ) && in_array( 'verbose', $args ) ){
+    $verbose = true;
+  }
+  
+  if ( ! $available = update_get_available( false ) ) {
+    
+    $data = array(
+      'status' => NAGIOS_STATUS_WARNING, 
+      'type'   => 'state',
+      'text'   => 'Unable to fetch update information, make sure cron has run recently',
+    );
+    
+    return array(
+      'key' => 'MOD_DETAIL',
+      'data' => $data,
+    );
+    
+  }
+  
+  module_load_include('inc', 'update', 'update.compare');
+  $update_data = update_calculate_project_data($available);
+
+  $nagios_status = NAGIOS_STATUS_OK;
+  $text = '';
+  
+  $fail_counts = array();
+  
+  foreach ( $update_data as $project_name => $project_update_info ){
+    
+    $project_status = $project_update_info['status'];
+    
+    if ( $project_status > 4 ){
+      continue;
+    }
+    
+    // if there are security updates available set nagios status to critical
+    $nagios_status = $project_status == UPDATE_NOT_SECURE ? NAGIOS_STATUS_CRITICAL : $nagios_status;
+    //  if update status is less than UPDATE_CURRENT
+    //   AND the update status is not already critical
+    //   set the update status to warning
+    $nagios_status = $project_status < UPDATE_CURRENT && $nagios_status != NAGIOS_STATUS_CRITICAL ? NAGIOS_STATUS_WARNING : $nagios_status;
+    
+    switch( $project_status ){
+      case UPDATE_NOT_SECURE:
+        $update_status_alias = 'not secure';
+        break;
+      case UPDATE_REVOKED:
+        $update_status_alias = 'revoked';
+        break;
+      case UPDATE_NOT_SUPPORTED:
+        $update_status_alias = 'not supported';
+        break;
+      case UPDATE_NOT_CURRENT:
+        $update_status_alias = 'not current';
+        break;
+      case UPDATE_UNKNOWN:
+      case UPDATE_NOT_CHECKED:
+      case UPDATE_NOT_FETCHED:
+        $update_status_alias = 'unknown';
+        break;
+    }
+    
+    $fail_counts[$update_status_alias] = isset( $fail_counts[$update_status_alias] ) ? ++$fail_counts[$update_status_alias] : 1;
+    
+    if ( $verbose ){
+      if ( $text && $project_status < UPDATE_CURRENT ){
+        $text .= ', ';
+      }
+      switch( $project_status ){
+        case UPDATE_NOT_SECURE:
+          $text .= t('@project_name is not secure!', array( '@project_name' => $project_name ) );
+          break;
+        case UPDATE_REVOKED:
+          $text .= t('@project_name project has been revoked!', array( '@project_name' => $project_name ) );
+          break;
+        case UPDATE_NOT_SUPPORTED:
+          $text .= t('@project_name is using an unsupported release', array( '@project_name' => $project_name ) );
+          break;
+        case UPDATE_NOT_CURRENT:
+          $text .= t('@project_name is out of date', array( '@project_name' => $project_name ) );
+          break;
+        case UPDATE_UNKNOWN:
+        case UPDATE_NOT_CHECKED:
+        case UPDATE_NOT_FETCHED:
+          $reason = isset($project_update_info['reason']) ? $project_update_info['reason'] : t('Can not determine status');
+          $text .= t('@project_name not checked: @reason', array( '@project_name' => $project_name, '@reason', $reason ) );
+          break;
+        default:
+          break;
+      }
+    }
+      
+  }
+  
+  $data = array(
+    'status' => $nagios_status, 
+    'type'   => 'state',
+    'text'   => $text,
+  );
+  
+  if ( ! $verbose ){
+    $data['text'] .= nagios_format_fail_count( $fail_counts );
+  }
+  
+  return array(
+    'key' => 'MOD_DETAIL',
+    'data' => $data,
+  );
+}
+
+/**
+ * Implementation of hook_nagios_checks().
+ */
+function nagios_nagios_checks() {
+  return nagios_functions();
+}
+
+/**
+ * Implementation of drush hook_nagios_check().
+ */
+function nagios_nagios_check($function, $args) {
+  // We don't bother to check if the function has been enabled by the user.
+  // Since this runs via drush, web security is not an issue.
+  $func = 'nagios_check_' . $function;
+  $result = $func($args);
+  $status[$result['key']] = $result['data'];
+  return $status;
+}
+
 function nagios_check_themes() {
   $count = (int)db_result(db_query("SELECT COUNT(*) FROM {system} WHERE status = 1 AND type = 'theme'"));
   $data = array(
@@ -420,4 +798,135 @@ function nagios_check_themes() {
     'key' => 'THM',
     'data' => $data,
   );
+}
+
+function nagios_check_watchdog( $args ){
+  // defaults
+  $warning_threshold = variable_get('nagios_watchdog_warning_threshold', NAGIOS_WATCHDOG_WARNING_THRESHOLD);
+  $critical_threshold = variable_get('nagios_watchdog_critical_threshold', NAGIOS_WATCHDOG_CRITICAL_THRESHOLD);
+  $hours = variable_get('nagios_watchdog_hours', NAGIOS_WATCHDOG_HOURS);
+  
+  // args from the drush command line
+  switch ( count( $args ) ){
+    case 3:
+      $hours = $args[2];
+    case 2:
+      $critical_threshold = $args[1];
+    case 1:
+      $warning_threshold = $args[0];
+      break;
+  }
+  
+  $threshold_period = $hours * 60 * 60;
+  
+  $sql = "SELECT SUM( CASE WHEN severity <= %d THEN 1 ELSE 0 END ) as warning_count, SUM( CASE WHEN severity <= %d THEN 1 ELSE 0 END ) as critical_count FROM {watchdog} WHERE timestamp > UNIX_TIMESTAMP() - %d;";
+  
+  $sql_args = array( WATCHDOG_WARNING, WATCHDOG_CRITICAL, $threshold_period );
+  $result = db_query( $sql, $sql_args );
+  
+  $watchdog_counts = db_fetch_object( $result );
+  
+  $str_total_errors = t( 'Critical: @total_critical. Warnings: @total_warning. In @hours hrs', array( '@total_critical' => $watchdog_counts->critical_count, '@total_warning' => $watchdog_counts->warning_count, '@hours' => $hours ) );
+  
+  if ( $watchdog_counts->critical_count >= $critical_threshold ){
+    $nagios_status = NAGIOS_STATUS_CRITICAL;
+    $nagios_status_text = t( '@critical or more critical errors. ', array( '@critical' => $critical_threshold,  ) );
+  }
+  else if ( $watchdog_counts->warning_count >= $warning_threshold ){
+    $nagios_status = NAGIOS_STATUS_WARNING;
+    $nagios_status_text = t( '@warning or more warnings. ', array( '@warning' => $warning_threshold,  ) );
+  }
+  else {
+    $nagios_status = NAGIOS_STATUS_OK;
+    $nagios_status_text = '';
+  }
+  
+  $nagios_status_text .= $str_total_errors;
+  $data = array(
+    'status' => $nagios_status, 
+    'type'   => 'state',
+    'text'   => $nagios_status_text,
+  );
+  
+  return array(
+    'key' => 'WATCHDOG',
+    'data' => $data,
+  );
+}
+
+function nagios_check_filesystem_access(){
+  $path = file_directory_path();
+  $dirs = nagios_get_subdirectories( $path );
+  
+  array_unshift( $dirs, $path );
+  
+  $nagios_status = NAGIOS_STATUS_OK;
+  $nagios_status_text = '';
+  
+  foreach( $dirs as $directory ){
+    $perms = fileperms( $directory );
+    $readablePerms = substr(sprintf('%o', $perms), -4);
+    
+    $writable_world = $perms & 0x0002 ? 1 : 0;
+    $writable_group = $perms & 0x0010 ? 1 : 0;
+    
+    $intFilegroup = filegroup ( $directory );
+    
+    $arrayFilegroupInfo = posix_getgrgid( $intFilegroup );
+    
+    $webserver_username = variable_get('nagios_webserver_username', NAGIOS_WEBSERVER_USERNAME );
+    
+    $writable_apache = in_array( $webserver_username, $arrayFilegroupInfo['members'] ) && $writable_group ? 1 : 0;
+    
+    if ( ! $writable_apache && ! $writable_world ){
+      $nagios_status = NAGIOS_STATUS_CRITICAL;
+      $nagios_status_text = t( '@directory not writable by @webserver_username user', array( '@directory' => $directory, '@webserver_username' => $webserver_username ) );
+      break;
+    }
+    elseif( $nagios_status == NAGIOS_STATUS_WARNING ){
+      continue;
+    }
+    elseif ( ! $writable_apache && $writable_world ) {
+      $nagios_status = NAGIOS_STATUS_WARNING;
+      $nagios_status_text = t( '@directory not writable by @webserver_username user, permissions set to 0777', array( '@directory' => $directory, '@webserver_username' => $webserver_username ) );
+    }
+    elseif ( $writable_world ){
+      $nagios_status = NAGIOS_STATUS_WARNING;
+      $nagios_status_text = t( '@directory permissions set to 0777', array( '@directory' => $directory, '@webserver_username' => $webserver_username ) );
+    }
+    
+  }
+  
+  $data = array(
+    'status' => $nagios_status, 
+    'type'   => 'state',
+    'text'   => $nagios_status_text,
+  );
+  
+  return array(
+    'key' => 'WATCHDOG',
+    'data' => $data,
+  );
+}
+
+function nagios_get_subdirectories( $path ){
+  $dirs = array();
+  if (is_dir($path) && $handle = opendir($path)) {
+    while (FALSE !== ($file = readdir($handle))) {
+      if ( $file[0] == '.' ){
+        continue;
+      }
+      
+      if ( ! is_dir($path . '/' . $file) ){
+        continue;
+      }
+      
+      $dirs[] = $path . '/' . $file;
+      
+      $dirs = array_merge( nagios_get_subdirectories( $path . '/' . $file ), $dirs );
+    }
+  }
+  
+  return $dirs;
+  
 }
